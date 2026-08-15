@@ -72,6 +72,14 @@ on:
         options: 
         - 'yes'
         - 'no'
+      RUNNER_BACKEND:
+        description: 'Self-hosted runner location:'
+        required: true
+        default: 'termux'
+        type: choice
+        options:
+        - 'termux'
+        - 'crave-devspace'
 
 jobs:
   Start-Runner:
@@ -84,22 +92,11 @@ jobs:
     - name: Set up environment
       run: |
         sudo apt-get update
-        sudo apt-get install -y tmux
+        sudo apt-get install -y gettext-base tmux
 
       # Download and configure 'crave'.
     - name: Configure the 'crave' environment
-      run: |
-        echo "DCDEVSPACE status: ${DCDEVSPACE}"
-        if [[ $DCDEVSPACE == *1* ]]; then
-        echo 'No need to set up crave, we are already running in devspace!'
-        else
-          mkdir ${HOME}/bin/
-          curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s --
-          mv ${PWD}/crave ${HOME}/bin/
-          sudo ln -sf /home/${USER}/bin/crave /usr/bin/crave
-          envsubst < ${PWD}/crave.conf.sample >> ${PWD}/crave.conf
-          rm -rf ${PWD}/crave.conf.sample          
-        fi
+      run: bash scripts/crave-setup.sh
       env:
         CRAVE_USERNAME: ${{  secrets.CRAVE_USERNAME  }}
         CRAVE_TOKEN: ${{  secrets.CRAVE_TOKEN  }}
@@ -217,7 +214,7 @@ jobs:
             export local_manifest_url="${local_manifest_url%/}"  # remove trailing slash if it exists
             LOCAL_MANIFEST="mkdir -p .repo/local_manifests && rm -rf .repo/local_manifests/* || true && curl -o .repo/local_manifests/local_manifest.xml ${local_manifest_url}"
           else
-            export LOCAL_MANIFEST="git clone ${{ github.event.inputs.LOCAL_MANIFEST }} --depth 1 -b ${{github.event.inputs.LOCAL_MANIFEST_BRANCH}} .repo/local_manifests"
+            export LOCAL_MANIFEST="mkdir -p .repo && rm -rf .repo/local_manifests && git clone ${{ github.event.inputs.LOCAL_MANIFEST }} --depth 1 -b ${{github.event.inputs.LOCAL_MANIFEST_BRANCH}} .repo/local_manifests"
           fi
 
         echo "Building on ${{ github.event.inputs.BASE_PROJECT }} project"
@@ -330,10 +327,16 @@ jobs:
       LOCAL_MANIFEST: "${{ needs.prepare.outputs.LOCAL_MANIFEST }}"
 
   build:
+    if: >-
+      ${{ always() && needs.test.result == 'success' &&
+          (needs.Start-Runner.result == 'success' || needs.Start-Runner.result == 'skipped') }}
     timeout-minutes: 1440
     name: Build using foss.crave.io
-    needs: test
-    runs-on: self-hosted
+    needs: [Start-Runner, test]
+    runs-on: >-
+      ${{ inputs.RUNNER_BACKEND == 'termux' &&
+          fromJSON('["self-hosted", "termux", "android"]') ||
+          fromJSON('["self-hosted"]') }}
     concurrency:
       group: ${{ github.repository_owner }}
     steps:
@@ -372,8 +375,19 @@ jobs:
         jobStatus: "Build Started"
         skipSuccess: false
 
-    - name: Cleanup
-      run: rm -rf * # This cleans github actions workspace
+      # actions/checkout performs its own workspace cleanup. This is deliberately
+      # before the Crave setup because a self-hosted workspace persists.
+    - name: Check-out to repository
+      uses: actions/checkout@v4
+
+    - name: Configure the build host's Crave environment
+      run: bash scripts/crave-setup.sh
+      env:
+        CRAVE_USERNAME: ${{ secrets.CRAVE_USERNAME }}
+        CRAVE_TOKEN: ${{ secrets.CRAVE_TOKEN }}
+
+    - name: Configure the build host's repo environment
+      run: bash scripts/repo-setup.sh
 
     - name: Check for a broken .bashrc
       continue-on-error: true
@@ -402,43 +416,36 @@ jobs:
       run: |
         echo "DCDEVSPACE status: ${DCDEVSPACE}"
         if [[ $DCDEVSPACE != *1* ]]; then
-
-          #curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s -- 
-
-          #mkdir -p ${HOME}/bin/
-          #mv ${PWD}/crave ${HOME}/bin/ 
-          #sudo ln -sf /home/${USER}/bin/crave /usr/bin/crave; sudo chmod +x /usr/bin/crave 
-
-          echo "Symlinking devspace folder"
-          mkdir -p devspace
-          sudo mkdir -p /crave-devspaces
-          sudo ln -sf ${pwd}/devspace /crave-devspaces
-          sudo chmod 777 /crave-devspaces
+          echo "Creating the local devspace folder"
+          if ! mkdir -p /crave-devspaces 2>/dev/null; then
+            if command -v sudo >/dev/null 2>&1; then
+              sudo mkdir -p /crave-devspaces
+              sudo chown "$(id -u):$(id -g)" /crave-devspaces
+            else
+              echo "Cannot create /crave-devspaces and sudo is unavailable." >&2
+              exit 1
+            fi
+          fi
         else
-          echo "We are already running in devspace... Skipping Symlinks"
+          echo "We are already running in devspace... Skipping local folder setup"
         fi
-        if grep -q "$PROJECTFOLDER" <(crave clone list --json | jq -r '.clones[]."Cloned At"') || [[ "${DCDEVSPACE}" == "1" ]]; then
-          crave clone destroy -y $PROJECTFOLDER || echo "Error removing $PROJECTFOLDER"
+
+        if grep -Fxq "$PROJECTFOLDER" <(crave clone list --json | jq -r '.clones[]."Cloned At"') || [[ "${DCDEVSPACE}" == "1" ]]; then
+          crave clone destroy -y "$PROJECTFOLDER" || echo "Error removing $PROJECTFOLDER"
         else          
-        echo "Skipping removal"
+          echo "Skipping removal"
         fi
 
         if [[ $DCDEVSPACE == *1* ]]; then
-          crave clone create --projectID $PROJECTID $PROJECTFOLDER || echo "Crave clone create failed!"
+          crave clone create --projectID "$PROJECTID" "$PROJECTFOLDER" || echo "Crave clone create failed!"
         else
-          mkdir -p $PROJECTFOLDER
+          mkdir -p "$PROJECTFOLDER"
         fi
-        
-      # Check-out in order to access the repository's files.
-    - name: Check-out to repository
-      uses: actions/checkout@v4
 
       # Set-up a spearate directory for the device.
     - name: Set-up workspace environment
       run: |
-        cd $PROJECTFOLDER
-        mkdir ${{ github.event.inputs.DEVICE_NAME }}
-        cd ${{ github.event.inputs.DEVICE_NAME }}
+        mkdir -p "$PROJECTFOLDER/${{ github.event.inputs.DEVICE_NAME }}"
       continue-on-error: true
       
       # Generate 'git' credential in base of the workflow's author.
@@ -447,32 +454,24 @@ jobs:
         git config --global user.name "${{ github.actor }}"
         git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
       
-      # Download and configure 'crave'.
+      # Configure the project-specific Crave files.
     - name: Configure the 'crave' environment
       run: |
         echo "DCDEVSPACE status: ${DCDEVSPACE}"
-        mkdir -p $PROJECTFOLDER/.repo/manifests
-        if [[ $DCDEVSPACE == *1* ]]; then
-        echo 'No need to set up crave, we are already running in devspace!'
-        else
-          curl -s https://raw.githubusercontent.com/accupara/crave/master/get_crave.sh | bash -s --
-          mv ${PWD}/crave ${HOME}/bin/
-          sudo ln -sf /home/${USER}/bin/crave /usr/bin/crave
-          envsubst < ${PWD}/crave.conf.sample >> ${PWD}/crave.conf
-          rm -rf ${PWD}/crave.conf.sample       
-          cp crave.conf $PROJECTFOLDER 
+        mkdir -p "$PROJECTFOLDER/.repo/manifests"
+        if [[ $DCDEVSPACE != *1* ]]; then
+          cp "$HOME/crave.conf" "$PROJECTFOLDER/crave.conf"
         fi
-        if [[ -z "${{ secrets.CUSTOM_YAML }}" ]]; then
-          cp configs/crave/crave.yaml.aosp $PROJECTFOLDER/.repo/manifests/crave.yaml
+        if [[ -z "$CUSTOM_YAML" ]]; then
+          cp configs/crave/crave.yaml.aosp "$PROJECTFOLDER/.repo/manifests/crave.yaml"
           echo "No Custom Configuration Found, Using Template!"
         else
-          touch $PROJECTFOLDER/.repo/manifests/crave.yaml || true
-          echo "${{ secrets.CUSTOM_YAML }}" > $PROJECTFOLDER/.repo/manifests/crave.yaml
+          touch "$PROJECTFOLDER/.repo/manifests/crave.yaml" || true
+          printf '%s\n' "$CUSTOM_YAML" > "$PROJECTFOLDER/.repo/manifests/crave.yaml"
           echo "Custom Configuration Found!"
         fi
       env:
-        CRAVE_USERNAME: ${{  secrets.CRAVE_USERNAME  }}
-        CRAVE_TOKEN: ${{  secrets.CRAVE_TOKEN  }}
+        CUSTOM_YAML: ${{ secrets.CUSTOM_YAML }}
 
       # Initialize the previously choosen 'repo' project.
     - name: Set the 'crave' project

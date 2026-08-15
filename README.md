@@ -84,6 +84,46 @@ Ensure you have no random spaces before or after
 
 (If the runner is offline still, trigger "Start/Restart Selfhosted Runner" workflow to force-restart the selfhosted runner)
 
+### Android / Termux self-hosted runner
+
+The GitHub runner cannot run directly against Android's Bionic C library. The
+included helper keeps Termux as the host and runs the official Linux runner in a
+small Ubuntu environment provided by `proot-distro`. The normal `ubuntu-*` jobs
+still run on GitHub; only the final `build` job is sent to the phone.
+
+1. In GitHub, open **Settings → Actions → Runners → New self-hosted runner** and
+   copy the repository URL and the short-lived registration token. Do not run
+   GitHub's generated Linux commands in the native Termux shell.
+2. In Termux, enter this repository and register the runner:
+
+   ```bash
+   cd "$HOME/crave_aosp_builder"
+   bash scripts/termux-runner.sh setup \
+     --url "https://github.com/OWNER/REPOSITORY" \
+     --token "REGISTRATION_TOKEN"
+   ```
+
+   The helper installs `proot-distro`, Ubuntu, `tmux`, the ARM/ARM64/x64 runner
+   matching the device, and the runner's current Linux dependencies. It registers
+   the custom labels `termux` and `android` so jobs cannot land on the wrong
+   self-hosted machine.
+3. Start **Crave Builder(self-hosted)** and select `termux` for
+   `RUNNER_BACKEND`. Select `crave-devspace` only for the older runner hosted in
+   a Crave devspace.
+
+Useful local commands:
+
+```bash
+bash scripts/termux-runner.sh status
+bash scripts/termux-runner.sh logs
+bash scripts/termux-runner.sh restart
+bash scripts/termux-runner.sh enable-boot
+```
+
+For reliable unattended runs, disable Android battery optimization for Termux.
+`enable-boot` additionally creates a launcher for the Termux:Boot app; install
+and open Termux:Boot once before relying on it after a phone reboot.
+
 ## Required Secrets
 ### CRAVE_USERNAME (Required)
 This is the email you signed up to crave with 
